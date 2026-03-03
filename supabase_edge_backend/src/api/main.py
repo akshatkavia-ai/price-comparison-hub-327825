@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
 from src.api.cache import CacheConfig, InMemoryTTLCache
+from src.api.db import PostgresClient, load_postgres_config
 from src.api.jobs import InMemoryJobManager
 from src.api.logging_utils import get_request_id, init_logging, set_request_id
 from src.api.models import (
@@ -18,8 +19,9 @@ from src.api.models import (
     JobStatusResponse,
     PriceHistoryResponse,
 )
+from src.api.persistence import PersistenceConfig, PostgresPersistence
 from src.api.rate_limiter import InMemoryRateLimiter, RateLimitConfig
-from src.api.service import InMemoryHistoryStore, PriceComparisonService
+from src.api.service import InMemoryHistoryStore, InMemoryPersistence, PriceComparisonService
 
 openapi_tags = [
     {"name": "Health", "description": "Service health and diagnostics."},
@@ -33,15 +35,26 @@ app = FastAPI(
         "Implements Price-Pal backend endpoints for price comparison, background jobs, caching, "
         "rate limiting, and structured logging. This container currently runs a FastAPI scaffold "
         "while the intended production target is Supabase Edge Functions (Deno). The internal "
-        "modules are designed to be portable so business logic can be migrated to Deno later."
+        "modules are designed to be portable so business logic can be migrated to Deno later.\n\n"
+        "Frontend integration note:\n"
+        "- React (Vite) should set VITE_API_BASE_URL to this service base URL (no trailing slash)."
     ),
-    version="0.3.0",
+    version="0.4.0",
     openapi_tags=openapi_tags,
 )
 
+# ---- CORS ----
+# Env contract:
+#   CORS_ALLOW_ORIGINS="http://localhost:5173,https://your-site.com"
+cors_allow_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+if cors_allow_origins_raw == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [o.strip() for o in cors_allow_origins_raw.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,11 +64,29 @@ app.add_middleware(
 init_logging(os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("price-pal")
 
-# ---- dependencies / singletons ----
+# ---- persistence wiring (DB preferred; in-memory fallback) ----
 _cache = InMemoryTTLCache()
 _cache_config = CacheConfig(ttl_seconds=int(os.getenv("CACHE_TTL_SECONDS", "300")))
 _history = InMemoryHistoryStore()
-_svc = PriceComparisonService(cache=_cache, cache_config=_cache_config, history=_history)
+
+_pg_cfg = load_postgres_config()
+_persistence = None
+if _pg_cfg:
+    try:
+        _pg = PostgresClient(_pg_cfg)
+        _persistence = PostgresPersistence(
+            pg=_pg, cfg=PersistenceConfig(cache_ttl_seconds=_cache_config.ttl_seconds)
+        )
+        logger.info("Postgres persistence enabled", extra={"event": "persistence_enabled", "kind": "postgres"})
+    except Exception:
+        logger.exception("Failed to initialize Postgres persistence; falling back to in-memory")
+        _persistence = InMemoryPersistence(cache=_cache, cache_config=_cache_config, history=_history)
+else:
+    # No DB configured: keep existing behavior (in-memory cache + history).
+    _persistence = InMemoryPersistence(cache=_cache, cache_config=_cache_config, history=_history)
+
+_svc = PriceComparisonService(persistence=_persistence)
+
 _jobs = InMemoryJobManager(svc=_svc)
 _rl = InMemoryRateLimiter()
 _rl_config = RateLimitConfig(
@@ -104,7 +135,10 @@ async def request_context_and_logging(request: Request, call_next):
                 "client_ip": _client_ip(request),
             },
         )
-        return JSONResponse(status_code=500, content={"detail": "Internal server error", "request_id": get_request_id()})
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "request_id": get_request_id()},
+        )
 
     duration_ms = int((time.time() - start) * 1000)
     logger.info(
@@ -166,7 +200,7 @@ def edge_usage_help():
     Intended production deployment is Supabase Edge Functions (Deno). Migration approach:
     - Keep API schemas stable (request/response models in `src/api/models.py`)
     - Port business logic from `service.py` and `scraper.py` to Deno (fetch + Cheerio/Playwright)
-    - Replace `InMemoryTTLCache`, `InMemoryHistoryStore`, and `InMemoryJobManager` with Supabase Postgres/KV/Queues
+    - Replace this scaffold's Postgres persistence adapter with Supabase JS client calls
 
     Returns:
         A short JSON message with the recommended migration path.
@@ -174,6 +208,9 @@ def edge_usage_help():
     return {
         "note": "This is a FastAPI scaffold; business logic is modular for later porting to Supabase Edge (Deno).",
         "modules": ["src/api/models.py", "src/api/service.py", "src/api/scraper.py"],
+        "frontend_env": {"VITE_API_BASE_URL": "http://localhost:3001"},
+        "backend_env": {"CORS_ALLOW_ORIGINS": "http://localhost:5173"},
+        "db_env": ["POSTGRES_URL", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_PORT"],
     }
 
 
@@ -200,6 +237,10 @@ async def compare_prices(
 
     Returns:
         ComparePricesResponse containing offers, best offer, and cache indication.
+
+    Errors:
+        429: Rate limit exceeded
+        500: Internal server error (with request_id)
     """
     if x_request_id:
         set_request_id(x_request_id)

@@ -1,18 +1,29 @@
 from __future__ import annotations
 
-import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import RLock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 from src.api.cache import CacheConfig, InMemoryTTLCache
 from src.api.models import ComparePricesRequest, ComparePricesResponse, PriceOffer
 from src.api.scraper import scrape_all_sites
 
+logger = logging.getLogger("price-pal.service")
 
-def _cache_key_for_query(query: str) -> str:
-    return hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()
+
+class Persistence(Protocol):
+    """Persistence protocol for caching and history.
+
+    Implementations:
+      - PostgresPersistence (durable)
+      - InMemoryHistoryStore/InMemoryTTLCache (legacy, used only if DB not configured)
+    """
+
+    def cache_get_compare(self, query: str) -> Optional[ComparePricesResponse]: ...
+    def cache_set_compare(self, query: str, resp: ComparePricesResponse) -> None: ...
+    def append_history_snapshots(self, query: str, offers: List[PriceOffer], job_id: Optional[str] = None) -> None: ...
+    def price_history(self, query: str, limit: int = 200) -> List[Dict[str, Any]]: ...
 
 
 @dataclass
@@ -25,6 +36,8 @@ class InMemoryHistoryStore:
     """In-memory history store. Replace with Supabase/Postgres for production."""
 
     def __init__(self) -> None:
+        from threading import RLock
+
         self._lock = RLock()
         self._by_query: Dict[str, List[HistoryItem]] = {}
 
@@ -51,20 +64,55 @@ class InMemoryHistoryStore:
         ]
 
 
-class PriceComparisonService:
-    """Coordinates cache, scraping, and history persistence."""
+class InMemoryPersistence:
+    """Bridges existing in-memory TTL cache + in-memory history to the Persistence protocol."""
 
     def __init__(self, cache: InMemoryTTLCache, cache_config: CacheConfig, history: InMemoryHistoryStore) -> None:
         self._cache = cache
         self._cache_config = cache_config
         self._history = history
 
-    async def compare(self, req: ComparePricesRequest) -> ComparePricesResponse:
-        key = _cache_key_for_query(req.query)
+    # PUBLIC_INTERFACE
+    def cache_get_compare(self, query: str) -> Optional[ComparePricesResponse]:
+        """Get cached ComparePricesResponse if present."""
+        import hashlib
 
+        key = hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()
+        cached = self._cache.get(key)
+        if isinstance(cached, ComparePricesResponse):
+            return cached
+        return None
+
+    # PUBLIC_INTERFACE
+    def cache_set_compare(self, query: str, resp: ComparePricesResponse) -> None:
+        """Set cached ComparePricesResponse with TTL."""
+        import hashlib
+
+        key = hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()
+        self._cache.set(key, resp, ttl_seconds=self._cache_config.ttl_seconds)
+
+    # PUBLIC_INTERFACE
+    def append_history_snapshots(self, query: str, offers: List[PriceOffer], job_id: Optional[str] = None) -> None:
+        """Append to in-memory history store."""
+        self._history.append(query, offers)
+
+    # PUBLIC_INTERFACE
+    def price_history(self, query: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Get in-memory history items."""
+        return self._history.get(query=query, limit=limit)
+
+
+class PriceComparisonService:
+    """Coordinates cache, scraping, and history persistence."""
+
+    def __init__(self, persistence: Persistence) -> None:
+        self._persistence = persistence
+
+    async def compare(self, req: ComparePricesRequest) -> ComparePricesResponse:
         if req.use_cache:
-            cached = self._cache.get(key)
-            if isinstance(cached, ComparePricesResponse):
+            cached = self._persistence.cache_get_compare(req.query)
+            if cached:
+                # Keep contract: cached=true, generated_at refreshed
                 return ComparePricesResponse(
                     query=cached.query,
                     offers=cached.offers,
@@ -88,9 +136,9 @@ class PriceComparisonService:
             generated_at=datetime.now(timezone.utc),
         )
 
-        self._cache.set(key, resp, ttl_seconds=self._cache_config.ttl_seconds)
-        self._history.append(req.query, offers)
+        self._persistence.cache_set_compare(req.query, resp)
+        self._persistence.append_history_snapshots(req.query, offers, job_id=None)
         return resp
 
     def history(self, query: str, limit: int = 200) -> List[Dict[str, Any]]:
-        return self._history.get(query=query, limit=limit)
+        return self._persistence.price_history(query=query, limit=limit)
